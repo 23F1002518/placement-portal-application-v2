@@ -1,0 +1,462 @@
+openapi: 3.0.3
+
+# =============================================================================
+# API Resource Endpoints — Placement Portal Application (PPA)
+# -----------------------------------------------------------------------------
+# | Endpoint                                              | Method | Description                                          |
+# |-------------------------------------------------------|--------|------------------------------------------------------|
+# | /api/register/student                                 | POST   | Register a new student account                       |
+# | /api/register/company                                 | POST   | Register a new company (awaits admin approval)       |
+# | /api/login                                            | POST   | Authenticate user and issue a JWT token              |
+# | /api/me                                               | GET    | Get the currently authenticated user                 |
+# | /api/drives                                           | GET    | List approved open drives (search/filter)            |
+# | /api/offer-letter/{application_id}                    | GET    | Download an offer letter PDF                         |
+# | /api/resume/{student_user_id}                         | GET    | Download a student's resume                          |
+# | /api/admin/dashboard                                  | GET    | Admin dashboard statistics (cached)                  |
+# | /api/admin/companies                                  | GET    | List/search companies                                |
+# | /api/admin/students                                   | GET    | List/search students                                 |
+# | /api/admin/drives                                     | GET    | List drives, optionally by status                    |
+# | /api/admin/company/{user_id}/approve                  | POST   | Approve a company registration (emails company)      |
+# | /api/admin/company/{user_id}/reject                   | POST   | Reject a company registration                        |
+# | /api/admin/drive/{drive_id}/approve                   | POST   | Approve a placement drive                            |
+# | /api/admin/drive/{drive_id}/reject                    | POST   | Reject a placement drive                             |
+# | /api/admin/user/{user_id}/blacklist                   | POST   | Blacklist a user (reverts company's approved drives) |
+# | /api/admin/user/{user_id}/deactivate                  | POST   | Deactivate a user account                            |
+# | /api/admin/user/{user_id}/activate                    | POST   | Reinstate (activate + un-blacklist) a user           |
+# | /api/admin/applications                               | GET    | List/search all applications                         |
+# | /api/admin/reports                                    | GET    | Aggregate placement report data (cached)             |
+# | /api/company/dashboard                                | GET    | Company profile and its drives                       |
+# | /api/company/drive                                    | POST   | Create a new drive (status Pending)                  |
+# | /api/company/drive/{drive_id}                         | PUT    | Update a drive (returns to Pending for re-approval)  |
+# | /api/company/drive/{drive_id}/close                   | POST   | Close a drive to further applications                |
+# | /api/company/drive/{drive_id}/applicants              | GET    | List applicants of a drive                           |
+# | /api/company/application/{application_id}             | PUT    | Update application status/interview/remarks          |
+# | /api/company/application/{application_id}/offer-letter        | POST | Generate offer letter PDF (Selected only)      |
+# | /api/company/application/{application_id}/offer-letter/email  | POST | Email the offer letter to the student          |
+# | /api/student/dashboard                                | GET    | Student profile and eligible open drives             |
+# | /api/student/drive/{drive_id}/apply                   | POST   | Apply to a drive (eligibility + duplicate checks)    |
+# | /api/student/applications                             | GET    | Own applications, optionally filtered by status      |
+# | /api/student/profile                                  | PUT    | Update student profile                               |
+# | /api/student/resume                                   | POST   | Upload resume (PDF/DOC/DOCX, max 5 MB)               |
+# | /api/student/export                                   | POST   | Trigger async CSV export of applications (Celery)    |
+# | /api/student/export/{task_id}                         | GET    | Poll export task status                              |
+# | /api/student/export/download/{filename}               | GET    | Download the generated CSV export                    |
+# =============================================================================
+
+info:
+  title: Placement Portal Application API
+  description: >
+    REST/JSON API for the Placement Portal (Flask + SQLite + Redis + Celery).
+    All endpoints are under /api. Authentication uses a JWT bearer token
+    obtained from /api/login and sent as "Authorization: Bearer <token>".
+    Validation failures return 422 with {"errors": {field: message}}.
+  version: 2.0.0
+
+servers:
+  - url: http://127.0.0.1:5000
+    description: Local development server
+
+tags:
+  - name: Auth
+    description: Registration, login and current-user endpoints (public)
+  - name: Common
+    description: Shared endpoints available to any authenticated role
+  - name: Admin
+    description: Admin-only endpoints (role=admin JWT required)
+  - name: Company
+    description: Company-only endpoints (role=company JWT required)
+  - name: Student
+    description: Student-only endpoints (role=student JWT required)
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  responses:
+    ValidationError:
+      description: 'Validation failed — body is {"errors": {field: message}}'
+    Unauthorized:
+      description: Missing or invalid JWT
+    Forbidden:
+      description: Authenticated but wrong role / not permitted
+
+security:
+  - bearerAuth: []
+
+paths:
+
+  # ---------------------------------------------------------------- Auth ----
+  /api/register/student:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Register a new student account
+      description: Creates a User (role=student) and StudentProfile. Fields — email, password, name, branch, cgpa, graduation_year, phone (optional).
+      responses:
+        "201": { description: Registration successful }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /api/register/company:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Register a new company (awaits admin approval)
+      description: Creates a User (role=company) and CompanyProfile with approved=false. Company cannot log in until the admin approves it.
+      responses:
+        "201": { description: "Registration submitted, pending admin approval" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /api/login:
+    post:
+      tags: [Auth]
+      security: []
+      summary: Authenticate user and issue a JWT token
+      description: Verifies email/password; rejects blacklisted, deactivated, or unapproved-company accounts. Returns {token, user}.
+      responses:
+        "200": { description: JWT token and user object }
+        "401": { description: Invalid email or password }
+        "403": { description: Blacklisted / deactivated / company pending approval }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /api/me:
+    get:
+      tags: [Auth]
+      summary: Get the currently authenticated user
+      responses:
+        "200": { description: Current user object }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  # -------------------------------------------------------------- Common ----
+  /api/drives:
+    get:
+      tags: [Common]
+      summary: List approved open drives (search/filter)
+      description: Approved, not-past-deadline drives from active, non-blacklisted companies (Redis-cached). Any authenticated role.
+      parameters:
+        - { name: q, in: query, schema: { type: string }, description: Search in drive title / company name }
+        - { name: branch, in: query, schema: { type: string }, description: Filter by eligible branch }
+        - { name: min_cgpa, in: query, schema: { type: number }, description: Show drives with min_cgpa <= value }
+      responses:
+        "200": { description: List of drives }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/offer-letter/{application_id}:
+    get:
+      tags: [Common]
+      summary: Download an offer letter PDF
+      description: Owning student or the drive's company only. Sent as a file attachment (requires JWT header — fetched as a blob by the SPA).
+      parameters:
+        - { name: application_id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200": { description: PDF file }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: No offer letter for this application }
+
+  /api/resume/{student_user_id}:
+    get:
+      tags: [Common]
+      summary: Download a student's resume
+      description: The student themself, or a company the student applied to.
+      parameters:
+        - { name: student_user_id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200": { description: Resume file }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: No resume uploaded }
+
+  # --------------------------------------------------------------- Admin ----
+  /api/admin/dashboard:
+    get:
+      tags: [Admin]
+      summary: Admin dashboard statistics (cached)
+      description: Counts of students, companies, drives, applications, pending approvals. Redis-cached.
+      responses:
+        "200": { description: Dashboard stats }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/admin/companies:
+    get:
+      tags: [Admin]
+      summary: List/search companies
+      parameters:
+        - { name: q, in: query, schema: { type: string }, description: Search by company name/email }
+      responses:
+        "200": { description: List of companies with standing (approved/blacklisted) }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/admin/students:
+    get:
+      tags: [Admin]
+      summary: List/search students
+      parameters:
+        - { name: q, in: query, schema: { type: string }, description: Search by student name/email }
+      responses:
+        "200": { description: List of students with standing }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/admin/drives:
+    get:
+      tags: [Admin]
+      summary: List drives, optionally by status
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [Pending, Approved, Rejected, Closed] } }
+      responses:
+        "200": { description: List of drives }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/admin/company/{user_id}/approve:
+    post:
+      tags: [Admin]
+      summary: Approve a company registration (emails company)
+      description: Sets approved=true; on first approval a notification email is sent to the company via Celery.
+      parameters:
+        - { name: user_id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200": { description: Company approved }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/admin/company/{user_id}/reject:
+    post:
+      tags: [Admin]
+      summary: Reject a company registration
+      parameters:
+        - { name: user_id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200": { description: Company rejected }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/admin/drive/{drive_id}/approve:
+    post:
+      tags: [Admin]
+      summary: Approve a placement drive
+      parameters:
+        - { name: drive_id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200": { description: Drive approved (visible to eligible students) }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/admin/drive/{drive_id}/reject:
+    post:
+      tags: [Admin]
+      summary: Reject a placement drive
+      parameters:
+        - { name: drive_id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200": { description: Drive rejected }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/admin/user/{user_id}/blacklist:
+    post:
+      tags: [Admin]
+      summary: Blacklist a user (reverts company's approved drives)
+      description: Blocks login. For companies, all Approved drives revert to Pending and disappear from student listings.
+      parameters:
+        - { name: user_id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200": { description: User blacklisted }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/admin/user/{user_id}/deactivate:
+    post:
+      tags: [Admin]
+      summary: Deactivate a user account
+      description: Legacy endpoint (superseded by blacklist in the UI); blocks login via active=false.
+      parameters:
+        - { name: user_id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200": { description: User deactivated }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/admin/user/{user_id}/activate:
+    post:
+      tags: [Admin]
+      summary: Reinstate (activate + un-blacklist) a user
+      parameters:
+        - { name: user_id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200": { description: User activated }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/admin/applications:
+    get:
+      tags: [Admin]
+      summary: List/search all applications
+      description: Optional q performs a case-insensitive partial match across student name, drive title and company name.
+      parameters:
+        - { name: q, in: query, schema: { type: string } }
+      responses:
+        "200": { description: List of applications }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/admin/reports:
+    get:
+      tags: [Admin]
+      summary: Aggregate placement report data (cached)
+      description: Chart data — applications by status, placements per company, monthly activity. Redis-cached.
+      responses:
+        "200": { description: Report datasets }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  # ------------------------------------------------------------- Company ----
+  /api/company/dashboard:
+    get:
+      tags: [Company]
+      summary: Company profile and its drives
+      responses:
+        "200": { description: "{profile, drives[]} with applicant counts" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/company/drive:
+    post:
+      tags: [Company]
+      summary: Create a new drive (status Pending)
+      description: Requires the company to be approved. Fields — title, description, eligible_branches[], min_cgpa, eligible_years[], deadline. Needs admin approval before students see it.
+      responses:
+        "201": { description: Drive created (Pending) }
+        "403": { description: Company not yet approved }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /api/company/drive/{drive_id}:
+    put:
+      tags: [Company]
+      summary: Update a drive (returns to Pending for re-approval)
+      parameters:
+        - { name: drive_id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200": { description: "Drive updated, status reset to Pending" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /api/company/drive/{drive_id}/close:
+    post:
+      tags: [Company]
+      summary: Close a drive to further applications
+      parameters:
+        - { name: drive_id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200": { description: Drive closed }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/company/drive/{drive_id}/applicants:
+    get:
+      tags: [Company]
+      summary: List applicants of a drive
+      parameters:
+        - { name: drive_id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200": { description: Applications for the drive }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/company/application/{application_id}:
+    put:
+      tags: [Company]
+      summary: Update application status/interview/remarks
+      description: Status follows Applied → Shortlisted → Selected/Rejected transitions. Setting or changing interview_datetime immediately emails the student (Celery).
+      parameters:
+        - { name: application_id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200": { description: Updated application }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /api/company/application/{application_id}/offer-letter:
+    post:
+      tags: [Company]
+      summary: Generate offer letter PDF (Selected only)
+      parameters:
+        - { name: application_id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "201": { description: Offer letter generated }
+        "200": { description: Offer letter already existed }
+        "422": { description: Application is not in Selected status }
+
+  /api/company/application/{application_id}/offer-letter/email:
+    post:
+      tags: [Company]
+      summary: Email the offer letter to the student
+      description: Queues a Celery task that emails the generated PDF to the student as an attachment.
+      parameters:
+        - { name: application_id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "202": { description: Email queued for sending }
+        "422": { description: Offer letter not generated yet }
+
+  # ------------------------------------------------------------- Student ----
+  /api/student/dashboard:
+    get:
+      tags: [Student]
+      summary: Student profile and eligible open drives
+      responses:
+        "200": { description: "{profile, eligible_drives[]}" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/student/drive/{drive_id}/apply:
+    post:
+      tags: [Student]
+      summary: Apply to a drive (eligibility + duplicate checks)
+      description: Validates drive is open, student meets branch/CGPA/year criteria, and no duplicate application exists (also DB-enforced).
+      parameters:
+        - { name: drive_id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "201": { description: Application created }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /api/student/applications:
+    get:
+      tags: [Student]
+      summary: Own applications, optionally filtered by status
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [Applied, Shortlisted, Selected, Rejected] } }
+      responses:
+        "200": { description: List of the student's applications }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/student/profile:
+    put:
+      tags: [Student]
+      summary: Update student profile
+      description: Fields — name, branch, cgpa, graduation_year, phone.
+      responses:
+        "200": { description: Updated profile }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /api/student/resume:
+    post:
+      tags: [Student]
+      summary: Upload resume (PDF/DOC/DOCX, max 5 MB)
+      description: multipart/form-data with a "resume" file field.
+      responses:
+        "200": { description: Resume stored on profile }
+        "422": { $ref: "#/components/responses/ValidationError" }
+
+  /api/student/export:
+    post:
+      tags: [Student]
+      summary: Trigger async CSV export of applications (Celery)
+      description: Returns {task_id}. The worker writes the CSV and emails it to the student as an attachment.
+      responses:
+        "202": { description: "Export task queued — {task_id}" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/student/export/{task_id}:
+    get:
+      tags: [Student]
+      summary: Poll export task status
+      parameters:
+        - { name: task_id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: "{state} plus {result: {file}} when SUCCESS" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/student/export/download/{filename}:
+    get:
+      tags: [Student]
+      summary: Download the generated CSV export
+      description: Only the owning student may download (filenames are export_user<id>_<taskid>.csv).
+      parameters:
+        - { name: filename, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: CSV file }
+        "403": { $ref: "#/components/responses/Forbidden" }
